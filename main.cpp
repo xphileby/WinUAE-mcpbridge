@@ -53,6 +53,7 @@
 #ifdef USE_SDL
 #include "SDL.h"
 #endif
+#include "mcpbridge.h"
 
 long int version = 256 * 65536L * UAEMAJOR + 65536L * UAEMINOR + UAESUBREV;
 
@@ -1265,6 +1266,8 @@ static int real_main2 (int argc, TCHAR **argv)
 	savestate_init ();
 #endif
 	keybuf_init (); /* Must come after init_joystick */
+
+	mcpbridge_init(7843);
 
 #ifdef DEBUGGER
 	disasm_init();

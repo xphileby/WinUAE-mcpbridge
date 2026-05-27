@@ -29,6 +29,7 @@
 #include "inputdevice.h"
 #include "inputrecord.h"
 #include "keybuf.h"
+#include "mcpbridge.h"
 #include "custom.h"
 #include "xwin.h"
 #include "drawing.h"
@@ -2990,7 +2991,7 @@ void inputdevice_tablet_info (int maxx, int maxy, int maxz, int maxax, int maxay
 	inputdevice_update_tablet_params();
 }
 
-static void inputdevice_mh_abs (int x, int y, uae_u32 buttonbits)
+void inputdevice_mh_abs (int x, int y, uae_u32 buttonbits)
 {
 	x -= mouseoffset_x + 1;
 	y -= mouseoffset_y + 2;
@@ -3672,6 +3673,7 @@ static void inputdevice_read(void)
 {
 //	if ((inputdevice_logging & (2 | 4)))
 //		write_log(_T("INPUTREAD\n"));
+	mcpbridge_drain();
 	inputdevice_read_msg(false);
 	if (inputread <= 0) {
 		idev[IDTYPE_MOUSE].read();

@@ -251,6 +251,7 @@ extern void setmousebuttonstate (int mouse, int button, int state);
 extern void setjoystickstate (int joy, int axle, int state, int max);
 extern int getjoystickstate (int mouse);
 void setmousestate (int mouse, int axis, int data, int isabs);
+extern void inputdevice_mh_abs (int x, int y, uae_u32 buttonbits);
 extern int getmousestate (int mouse);
 extern void inputdevice_updateconfig (struct uae_prefs *srcprefs, struct uae_prefs *dstprefs);
 extern void inputdevice_updateconfig_internal (struct uae_prefs *srcprefs, struct uae_prefs *dstprefs);

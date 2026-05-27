@@ -867,6 +867,118 @@ static void __cdecl output_flush_fn(png_structp p)
 {
 }
 
+// PNG-to-memory: mirrors savepng() but writes to a malloc'd buffer instead
+// of a FILE*. Used by mcpbridge's screenshot tool.
+struct png_membuf {
+	uae_u8 *data;
+	size_t len;
+	size_t cap;
+};
+static void __cdecl png_membuf_write(png_structp p, png_bytep d, png_size_t n)
+{
+	struct png_membuf *m = (struct png_membuf *)png_get_io_ptr(p);
+	if (m->len + n > m->cap) {
+		size_t newcap = m->cap ? m->cap : 65536;
+		while (newcap < m->len + n) newcap *= 2;
+		uae_u8 *p2 = (uae_u8 *)realloc(m->data, newcap);
+		if (!p2) png_error(p, "oom");
+		m->data = p2;
+		m->cap = newcap;
+	}
+	memcpy(m->data + m->len, d, n);
+	m->len += n;
+}
+static void __cdecl png_membuf_flush(png_structp p) { (void)p; }
+
+static int savepng_to_mem(uae_u8 **out_data, size_t *out_len, bool alpha)
+{
+	png_structp png_ptr;
+	png_infop info_ptr;
+	png_bytep *row_pointers;
+	int h = bi->bmiHeader.biHeight;
+	int w = bi->bmiHeader.biWidth;
+	int d = bi->bmiHeader.biBitCount;
+	png_color pngpal[256];
+	int i;
+	struct png_membuf buf = { 0 };
+
+	*out_data = NULL;
+	*out_len = 0;
+
+	png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, pngtest_blah, pngtest_blah, pngtest_blah);
+	if (!png_ptr) return 1;
+	info_ptr = png_create_info_struct(png_ptr);
+	if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); return 2; }
+	if (setjmp(png_jmpbuf(png_ptr))) {
+		png_destroy_write_struct(&png_ptr, &info_ptr);
+		free(buf.data);
+		return 3;
+	}
+	count_colors(alpha);
+	png_set_write_fn(png_ptr, &buf, png_membuf_write, png_membuf_flush);
+	png_set_filter(png_ptr, 0, PNG_FILTER_NONE);
+	png_set_IHDR(png_ptr, info_ptr, w, h, 8,
+		uniquecolorcount <= 256 && uniquecolorcount >= 0 ? PNG_COLOR_TYPE_PALETTE : (alpha ? PNG_COLOR_TYPE_RGB_ALPHA : PNG_COLOR_TYPE_RGB),
+		PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+	row_pointers = xmalloc(png_bytep, h);
+	if (palettebm) {
+		for (i = 0; i < (1 << uniquecolordepth); i++) {
+			pngpal[i].red = (uniquecolors[i] >> 0) & 0xff;
+			pngpal[i].green = (uniquecolors[i] >> 8) & 0xff;
+			pngpal[i].blue = (uniquecolors[i] >> 16) & 0xff;
+		}
+		png_set_PLTE(png_ptr, info_ptr, pngpal, 1 << uniquecolordepth);
+		for (i = 0; i < h; i++) {
+			int j = h - i - 1;
+			row_pointers[i] = palettebm + j * w;
+		}
+	} else {
+		if (d <= 8) {
+			for (i = 0; i < (1 << d); i++) {
+				pngpal[i].red = bi->bmiColors[i].rgbRed;
+				pngpal[i].green = bi->bmiColors[i].rgbGreen;
+				pngpal[i].blue = bi->bmiColors[i].rgbBlue;
+			}
+			png_set_PLTE(png_ptr, info_ptr, pngpal, 1 << d);
+		}
+		for (i = 0; i < h; i++) {
+			int j = h - i - 1;
+			row_pointers[i] = (uae_u8 *)lpvBits + j * (((w * (d <= 8 ? 8 : (alpha ? 32 : 24)) + 31) & ~31) / 8);
+		}
+	}
+	png_set_rows(png_ptr, info_ptr, row_pointers);
+	png_write_png(png_ptr, info_ptr, PNG_TRANSFORM_BGR, NULL);
+	png_destroy_write_struct(&png_ptr, &info_ptr);
+	xfree(row_pointers);
+	xfree(palettebm);
+	palettebm = NULL;
+
+	*out_data = buf.data;
+	*out_len = buf.len;
+	return 0;
+}
+
+// External: prepare + encode + free. Caller must free *out_data via free().
+// imagemode: 0 = host-window scale, 1 = native chipset / "original".
+int screenshot_capture_png(int monid, int imagemode,
+	uae_u8 **out_data, size_t *out_len, int *out_w, int *out_h)
+{
+	int rc;
+	*out_data = NULL;
+	*out_len = 0;
+	if (out_w) *out_w = 0;
+	if (out_h) *out_h = 0;
+	if (!screenshot_prepare(monid, imagemode))
+		return -1;
+	rc = savepng_to_mem(out_data, out_len, usealpha());
+	if (rc == 0) {
+		if (out_w) *out_w = bi ? bi->bmiHeader.biWidth : 0;
+		if (out_h) *out_h = bi ? bi->bmiHeader.biHeight : 0;
+	}
+	screenshot_free();
+	return rc;
+}
+
 static int saveiff(FILE *fp, bool alpha)
 {
 	const uae_u8 iffilbm[] = {
