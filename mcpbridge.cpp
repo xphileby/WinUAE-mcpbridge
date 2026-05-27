@@ -691,6 +691,35 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
         return ok_text("toggled");
     }
 
+    // -- set_speed (CPU speed / turbo) ---------------------------------
+    if (name == "set_speed") {
+        std::string mode = obj_str(js, toks, args_idx, "mode");
+        if (mode.empty()) return err("missing 'mode' (turbo|max|original|balanced)");
+        if (mode == "turbo") {
+            currprefs.turbo_emulation = 1;
+            changed_prefs.turbo_emulation = 1;
+        } else if (mode == "max") {
+            currprefs.turbo_emulation = 0;
+            changed_prefs.turbo_emulation = 0;
+            currprefs.m68k_speed = 0;
+            changed_prefs.m68k_speed = 0;
+        } else if (mode == "original") {
+            currprefs.turbo_emulation = 0;
+            changed_prefs.turbo_emulation = 0;
+            currprefs.m68k_speed = -1;
+            changed_prefs.m68k_speed = -1;
+        } else if (mode == "balanced") {
+            currprefs.turbo_emulation = 0;
+            changed_prefs.turbo_emulation = 0;
+            currprefs.m68k_speed = 1;
+            changed_prefs.m68k_speed = 1;
+        } else {
+            return err("'mode' must be turbo|max|original|balanced");
+        }
+        set_config_changed();
+        return ok_text(std::string("set speed mode=") + mode);
+    }
+
     // -- quit (immediate, just sets a flag) ----------------------------
     // uae_quit() sets quit_program; the main loop sees it and tears down.
     // Safe from receiver thread.
@@ -1228,7 +1257,10 @@ const char *TOOLS_LIST_JSON =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},\"w\":{\"type\":\"integer\"},\"h\":{\"type\":\"integer\"},\"timeout_ms\":{\"type\":\"integer\"}},\"required\":[\"x\",\"y\",\"w\",\"h\"]}},"
   "{\"name\":\"wait_for_idle\","
     "\"description\":\"Block until the 68k CPU has been in STOP state continuously for 'quiet_ms' (default 200) or until timeout. Useful for 'wait until boot finished'.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"timeout_ms\":{\"type\":\"integer\"},\"quiet_ms\":{\"type\":\"integer\"}}}}"
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"timeout_ms\":{\"type\":\"integer\"},\"quiet_ms\":{\"type\":\"integer\"}}}},"
+  "{\"name\":\"set_speed\","
+    "\"description\":\"Set CPU emulation speed. mode: 'turbo' (frame-uncapped fast-forward), 'max' (run at host speed, no throttle), 'original' (cycle-accurate 68000 timing), 'balanced' (default mixed mode).\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"turbo\",\"max\",\"original\",\"balanced\"]}},\"required\":[\"mode\"]}}"
 "]}";
 
 const char *INIT_RESULT_JSON =
