@@ -143,6 +143,43 @@ apply to tag 6030 — re-verify after checkout)
 - `set_config magic_mouse=false` flipped the field through `cfgfile_parse_line`
 - `disk_list` returned `{drives:[{drive:0,path:"",type:-1},...]}`
 
+## Mouse control findings (verified by driving Workbench mouse-only)
+
+Tested end-to-end by opening Workbench disk → Prefs drawer → Input editor
+using only `mouse_move` + `mouse_button` (no keyboard). See
+`tools/demo-mouse-nav.ps1` for the working navigation pattern.
+
+**The semantics of `mouse_move(space:'host')` when mousehack is NOT alive
+are RELATIVE, not absolute.** In `setmousestate`'s isabs branch, `*oldm_p`
+is reset to 0 at the end of every call (`inputdevice.cpp` ~line 9868), so
+each call computes `delta = data - 0 = data`. The "absolute coordinate" you
+pass is actually applied as a relative delta, metered into the guest's
+hardware mouse counters over the following frames.
+
+Practical rules for reliable pointer control (AmigaOS 3.x, no mousehack):
+
+1. **Treat each `mouse_move(space:'host')` call as `move_rel(dx, dy)`.**
+2. **Keep each delta ≤ 50 per axis.** The guest mouse driver reads the
+   8-bit hardware counters (`MOUSE0DAT`) once per vsync and interprets the
+   difference as signed 8-bit; accumulated deltas > 127 in one frame alias
+   (e.g. +200 reads as −56). Two queued 50-unit steps landing in the same
+   vsync still sum to a safe 100.
+3. **Pace calls ≥ 90 ms apart.** The bridge replies when the command is
+   *queued*, not drained, so back-to-back calls can land in one vsync.
+4. **Calibrate by pinning**: ~32 paced steps of (−50,−50) pins the pointer
+   at guest (0,0) regardless of starting position. From there, relative
+   moves are exact (scale is 1:1 with native-screenshot pixels).
+5. **Origin offset**: in `screenshot(scale:'native')` images, guest (0,0)
+   renders at pixel (54,28) — the overscan border. So to click on
+   screenshot pixel (px,py): pin, then move_rel(px−54, py−28).
+6. **Clicks**: use `mouse_button` down/up pairs with ~90 ms between down
+   and up. A queued `mouse_click count:2` drains in one vsync and the guest
+   may not register it. For a double-click: click, ~60 ms gap, click.
+
+Future bridge improvement: add a real `mouse_move_rel(dx,dy)` tool that
+chunks + paces inside the drain (one chunk per vsync), and make
+`space:'host'` truly absolute by doing pin+walk internally.
+
 ## Open issues — re-investigate after rebase to 6030
 
 1. **`cfgfile_parse_line(absolute_mouse=N)` silently no-ops on this build.**
