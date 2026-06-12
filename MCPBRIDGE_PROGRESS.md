@@ -363,10 +363,36 @@ reply, per JSON-RPC spec).
 **If the relay errors out** (connection refused) the message lands on
 stderr; Claude Desktop surfaces MCP-server stderr in its log panel.
 
-### Step 9 — Tier-2 misc (lower priority, on demand)
-DONE: `set_speed`, `mount_dir`, `inject_event`, `get_config`.
-Remaining: `breakpoint_set/clear` (+ on_break notification),
-`serial_read/write`, `audio_levels/record`, screen-mode-change notification.
+### Step 9 — Tier-2 misc — ALL DONE
+`set_speed`, `mount_dir`, `inject_event`, `get_config`,
+`breakpoint_set/clear/list/continue` (+ notifications/breakpoint),
+`serial_read/write`, `audio_levels`, `audio_record`,
+notifications/screen_mode_changed.
+
+Notes from the final batch:
+- **Breakpoints** are bridge-owned: `mcpbridge_breakpoints_arm()` in debug.cpp
+  arms TRACE_CHECKONLY + debugging=-1 without the interactive console. On a
+  hit, `mcpbridge_debug_hook()` parks the emu thread at the EXACT PC (sound
+  paused) until breakpoint_continue. The writer thread polls the hit seq and
+  pushes notifications/breakpoint {pc, seq}. While parked, the drain is dead,
+  so `debug` and `disassemble` detect the break state and call debug_parser
+  directly on the receiver thread (uaeipc precedent); get_cpu_state and
+  memory_read were always direct. breakpoint_clear while stopped auto-resumes
+  (otherwise the hook would wait forever). Memwatch-triggered stops still use
+  the interactive console (not bridged).
+- **Serial** needs no host serial port: TX taps `checksend()` in
+  serial_win32.cpp before the serempty short-circuit (captures every guest
+  byte even in serempty mode); RX injects via the existing public
+  `serreceive_external()` (same entry RetroPlatform modem uses), queued to
+  the emu thread, 200 bytes/call cap (engine buffer size).
+- **audio_levels** reads the four Paula channel structs via an accessor in
+  audio.cpp. **audio_record** taps `finish_sound_buffer()` and wraps the raw
+  16-bit stereo stream in a WAV header. On hosts with no active sound device
+  the tap never fires and the tool reports "no audio captured" (this VM does
+  exactly that — tool verified only down to the error path).
+- **screen_mode_changed** notification polls drawbuffer dims + picasso_on +
+  gfx_fullscreen in the writer loop. Interlace jitters drawbuffer height by
+  ~2px constantly, so height-only changes ≤8px are ignored (else spam).
 
 Notes from implementing the step-9 batch (all three verified live):
 - `mount_dir` uses `filesys_media_change(dir, 2, NULL)` — the drag&drop

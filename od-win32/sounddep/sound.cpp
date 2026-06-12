@@ -2855,6 +2855,12 @@ void finish_sound_buffer (void)
 		return;
 	}
 
+	// mcpbridge: capture the mixed Paula output while audio_record is active.
+	{
+		extern void mcpbridge_audio_tap(const uae_u8 *data, int bytes);
+		mcpbridge_audio_tap((const uae_u8 *)paula_sndbuffer, bufsize);
+	}
+
 	if (currprefs.turbo_emulation) {
 		paula_sndbufpt = paula_sndbuffer;
 		return;

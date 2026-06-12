@@ -621,6 +621,13 @@ static void checksend(void)
 		return;
 	}
 
+	// mcpbridge: tap every guest-transmitted byte, regardless of whether a
+	// host serial device is attached (works in serempty mode too).
+	{
+		extern void mcpbridge_serial_tx(int c);
+		mcpbridge_serial_tx(serdatshift_masked);
+	}
+
 #ifdef ARCADIA
 	if (alg_flag || currprefs.genlock_image >= 7) {
 		ld_serial_read(serdatshift);

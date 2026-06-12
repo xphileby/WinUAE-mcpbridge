@@ -161,6 +161,74 @@ static void debug_continue(void)
 	set_special(SPCFLAG_BRK);
 }
 
+// ---------------------------------------------------------------------------
+// mcpbridge remote-breakpoint support.
+//
+// When the bridge "owns" debugging, a breakpoint hit does NOT enter the
+// interactive console (which would block the emu thread on console input).
+// Instead the emu thread parks right here at the exact PC, with sound
+// paused, until the MCP client calls breakpoint_continue. The bridge's
+// writer thread polls mcpbridge_break_state() to emit a notification.
+// ---------------------------------------------------------------------------
+
+static volatile int mcpbridge_debug_owned;
+static volatile int mcpbridge_break_hit;
+static volatile uae_u32 mcpbridge_break_pc_v;
+static volatile int mcpbridge_break_seq_v;
+
+// (Re)arm or disarm per-instruction trace checking based on enabled bpnodes.
+// own=1 marks the bridge as owner (console suppressed on hit).
+void mcpbridge_breakpoints_arm(int own)
+{
+	mcpbridge_debug_owned = own;
+	int any = 0;
+	for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+		if (bpnodes[i].enabled)
+			any = 1;
+	}
+	if (any && own) {
+		if (!trace_mode)
+			trace_mode = TRACE_CHECKONLY;
+		set_special(SPCFLAG_BRK);
+		debugging = -1;
+	} else if (!any && own && !debugger_active) {
+		if (trace_mode == TRACE_CHECKONLY)
+			trace_mode = 0;
+		debugging = 0;
+	}
+}
+
+// Poll from the bridge: returns 1 if currently stopped at a breakpoint.
+int mcpbridge_break_state(uae_u32 *pc, int *seq)
+{
+	if (pc) *pc = mcpbridge_break_pc_v;
+	if (seq) *seq = mcpbridge_break_seq_v;
+	return mcpbridge_break_hit;
+}
+
+void mcpbridge_break_continue(void)
+{
+	mcpbridge_break_hit = 0;
+}
+
+// Called from debug() when a stop condition fired. Returns 1 if the bridge
+// handled the stop (caller should re-arm tracing and return, skipping the
+// interactive console).
+static int mcpbridge_debug_hook(int bpnum)
+{
+	if (!mcpbridge_debug_owned)
+		return 0;
+	mcpbridge_break_pc_v = m68k_getpc();
+	mcpbridge_break_seq_v++;
+	mcpbridge_break_hit = 1;
+	pause_sound();
+	while (mcpbridge_break_hit && !quit_program) {
+		sleep_millis(5);
+	}
+	resume_sound();
+	return 1;
+}
+
 bool debug_enforcer(void)
 {
 	if (!break_if_enforcer)
@@ -7819,6 +7887,12 @@ void debug (void)
 				}
 			}
 			if (!bp && bpnum < 0) {
+				debug_continue();
+				return;
+			}
+			if (mcpbridge_debug_hook(bpnum)) {
+				// Bridge handled the stop; keep tracing armed for the
+				// next hit and skip the interactive console entirely.
 				debug_continue();
 				return;
 			}

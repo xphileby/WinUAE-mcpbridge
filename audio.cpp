@@ -355,6 +355,18 @@ static void do_samplerip (struct audio_channel_data *adp)
 static struct audio_channel_data audio_channel[AUDIO_CHANNELS_PAULA];
 static struct audio_stream_data audio_stream[AUDIO_CHANNEL_STREAMS];
 static struct audio_channel_data2 *audio_data[AUDIO_CHANNELS_PAULA + AUDIO_CHANNEL_STREAMS * AUDIO_CHANNEL_MAX_STREAM_CH];
+
+// mcpbridge: snapshot of the four Paula channels (volume, period, length,
+// state machine position). Read-only peek for the audio_levels tool.
+void mcpbridge_get_audio_channels(int *vol, int *per, int *len, int *state)
+{
+	for (int i = 0; i < AUDIO_CHANNELS_PAULA; i++) {
+		vol[i] = audio_channel[i].data.audvol;
+		per[i] = audio_channel[i].per;
+		len[i] = audio_channel[i].len;
+		state[i] = audio_channel[i].state;
+	}
+}
 int sound_available = 0;
 void (*sample_handler) (void);
 static void(*sample_prehandler) (unsigned long best_evtime);

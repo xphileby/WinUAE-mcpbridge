@@ -55,6 +55,14 @@
 // Defined in od-win32/screenshot.cpp.
 extern int screenshot_capture_png(int monid, int imagemode,
     uae_u8 **out_data, size_t *out_len, int *out_w, int *out_h);
+// Defined in audio.cpp.
+extern void mcpbridge_get_audio_channels(int *vol, int *per, int *len, int *state);
+// Defined in od-win32/serial_win32.cpp.
+extern bool serreceive_external(uae_u16 v);
+// Defined in debug.cpp.
+extern void mcpbridge_breakpoints_arm(int own);
+extern int mcpbridge_break_state(uae_u32 *pc, int *seq);
+extern void mcpbridge_break_continue(void);
 
 namespace {
 
@@ -82,6 +90,7 @@ enum cmd_kind {
     CMD_SCREENSHOT,          // a=imagemode (0=host, 1=native); reply via pending_reply
     CMD_MOUNT_DIR,           // text=host dir; reply via pending_reply
     CMD_INJECT_EVENT,        // text=name + '\n' + value; reply via pending_reply
+    CMD_SERIAL_WRITE,        // text=raw bytes to feed guest RX; reply via pending_reply
 };
 
 struct mcp_cmd {
@@ -225,6 +234,21 @@ std::mutex g_send_mtx;
 std::deque<std::string> g_send_q;          // serialized frames, no trailing \n
 std::condition_variable g_send_cv;
 std::thread g_writer_thr;
+
+// ---------------------------------------------------------------------------
+// Serial bridge state (TX = guest->host capture, fed by serial_win32 tap).
+// ---------------------------------------------------------------------------
+std::mutex g_ser_mtx;
+std::deque<uint8_t> g_ser_tx;          // guest-transmitted bytes
+constexpr size_t SER_TX_CAP = 65536;   // drop-oldest beyond this
+
+// ---------------------------------------------------------------------------
+// Audio capture state (fed by the finish_sound_buffer tap).
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_audio_capturing{false};
+std::mutex g_audio_mtx;
+std::vector<uint8_t> g_audio_buf;
+constexpr size_t AUDIO_CAP = 4 * 1024 * 1024;   // hard cap ~4MB raw
 
 void log_msg(const TCHAR *fmt, ...)
 {
@@ -1049,6 +1073,242 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
         return ok_text("event fired: " + ev);
     }
 
+    // -- serial_write ----------------------------------------------------
+    // Feed bytes into the guest's serial RX (as if a connected device sent
+    // them). Pass 'text' for ASCII or 'data_b64' for binary. Max 200 bytes
+    // per call (the engine-side RX buffer size); chunk larger payloads.
+    if (name == "serial_write") {
+        std::string data = obj_str(js, toks, args_idx, "text");
+        if (data.empty()) {
+            std::string b64 = obj_str(js, toks, args_idx, "data_b64");
+            if (b64.empty() || !b64_decode(b64, data) || data.empty())
+                return err("provide 'text' or valid non-empty 'data_b64'");
+        }
+        if (data.size() > 200) return err("max 200 bytes per call; chunk larger payloads");
+        mcp_cmd c; c.kind = CMD_SERIAL_WRITE; c.text = std::move(data);
+        int rid = new_pending();
+        c.reply_id = rid;
+        enqueue(std::move(c));
+        std::string out_text;
+        if (!wait_pending(rid, out_text, 10000)) {
+            drop_pending(rid);
+            return err("serial_write timed out (is emulation running?)");
+        }
+        drop_pending(rid);
+        return ok_text(out_text);
+    }
+
+    // -- serial_read -----------------------------------------------------
+    // Read bytes the guest transmitted over the serial port. Non-blocking by
+    // default; 'timeout_ms' polls until at least one byte arrives.
+    if (name == "serial_read") {
+        int maxb = obj_int(js, toks, args_idx, "max", 4096);
+        if (maxb < 1) maxb = 1;
+        if (maxb > 65536) maxb = 65536;
+        int timeout = obj_int(js, toks, args_idx, "timeout_ms", 0);
+        if (timeout < 0) timeout = 0;
+        if (timeout > 30000) timeout = 30000;
+        auto start = std::chrono::steady_clock::now();
+        std::string data;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> g(g_ser_mtx);
+                while (!g_ser_tx.empty() && (int)data.size() < maxb) {
+                    data.push_back((char)g_ser_tx.front());
+                    g_ser_tx.pop_front();
+                }
+            }
+            if (!data.empty() || timeout == 0)
+                break;
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >= timeout)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        // ASCII preview with non-printables as '.'
+        std::string preview;
+        for (char ch : data)
+            preview.push_back((ch >= 0x20 && ch < 0x7f) ? ch : '.');
+        std::string b64 = b64_encode((const uint8_t *)data.data(), data.size());
+        std::string inner = "{\"count\":" + std::to_string(data.size()) +
+            ",\"data_b64\":\"" + b64 + "\",\"text\":\"" + esc_json(preview) + "\"}";
+        std::string out = "{\"content\":[{\"type\":\"text\",\"text\":\"";
+        out += esc_json(inner);
+        out += "\"}]}";
+        return ok_raw(out);
+    }
+
+    // -- audio_levels ----------------------------------------------------
+    if (name == "audio_levels") {
+        int vol[4], per[4], len[4], state[4];
+        mcpbridge_get_audio_channels(vol, per, len, state);
+        std::string inner = "{\"channels\":[";
+        for (int i = 0; i < 4; i++) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "%s{\"ch\":%d,\"volume\":%d,\"period\":%d,\"length\":%d,\"active\":%s}",
+                     i ? "," : "", i, vol[i], per[i], len[i], state[i] ? "true" : "false");
+            inner += buf;
+        }
+        inner += "]}";
+        std::string out = "{\"content\":[{\"type\":\"text\",\"text\":\"";
+        out += esc_json(inner);
+        out += "\"}]}";
+        return ok_raw(out);
+    }
+
+    // -- audio_record ----------------------------------------------------
+    // Capture the mixed Paula output for 'ms' (max 5000). Returns a complete
+    // WAV file as base64. 16-bit stereo at the current sound_freq.
+    if (name == "audio_record") {
+        int ms = obj_int(js, toks, args_idx, "ms", 1000);
+        if (ms < 50) ms = 50;
+        if (ms > 5000) ms = 5000;
+        if (g_audio_capturing.load()) return err("a recording is already in progress");
+        {
+            std::lock_guard<std::mutex> g(g_audio_mtx);
+            g_audio_buf.clear();
+        }
+        int rate = currprefs.sound_freq > 0 ? currprefs.sound_freq : 48000;
+        g_audio_capturing.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        g_audio_capturing.store(false);
+        std::vector<uint8_t> raw;
+        {
+            std::lock_guard<std::mutex> g(g_audio_mtx);
+            raw.swap(g_audio_buf);
+        }
+        if (raw.empty())
+            return err("no audio captured (sound disabled or turbo mode active?)");
+        // Wrap in a canonical 44-byte WAV header: PCM, 2ch, 16-bit.
+        const int ch = 2, bits = 16;
+        uint32_t datalen = (uint32_t)raw.size();
+        uint32_t byterate = (uint32_t)rate * ch * (bits / 8);
+        uint16_t blockalign = (uint16_t)(ch * (bits / 8));
+        uint8_t hdr[44];
+        memcpy(hdr, "RIFF", 4);
+        uint32_t riffsz = 36 + datalen;          memcpy(hdr + 4, &riffsz, 4);
+        memcpy(hdr + 8, "WAVEfmt ", 8);
+        uint32_t fmtsz = 16;                     memcpy(hdr + 16, &fmtsz, 4);
+        uint16_t fmt = 1;                        memcpy(hdr + 20, &fmt, 2);
+        uint16_t nch = ch;                       memcpy(hdr + 22, &nch, 2);
+        uint32_t srate = (uint32_t)rate;         memcpy(hdr + 24, &srate, 4);
+        memcpy(hdr + 28, &byterate, 4);
+        memcpy(hdr + 32, &blockalign, 2);
+        uint16_t b16 = bits;                     memcpy(hdr + 34, &b16, 2);
+        memcpy(hdr + 36, "data", 4);
+        memcpy(hdr + 40, &datalen, 4);
+        std::vector<uint8_t> wav;
+        wav.reserve(sizeof(hdr) + raw.size());
+        wav.insert(wav.end(), hdr, hdr + sizeof(hdr));
+        wav.insert(wav.end(), raw.begin(), raw.end());
+        std::string b64 = b64_encode(wav.data(), wav.size());
+        char meta[160];
+        snprintf(meta, sizeof(meta),
+                 "{\"ms\":%d,\"rate\":%d,\"channels\":%d,\"bits\":%d,\"wav_bytes\":%zu}",
+                 ms, rate, ch, bits, wav.size());
+        std::string out = "{\"content\":[{\"type\":\"text\",\"text\":\"";
+        out += esc_json(meta);
+        out += "\"},{\"type\":\"text\",\"text\":\"";
+        out += b64;
+        out += "\"}]}";
+        return ok_raw(out);
+    }
+
+    // -- breakpoint_set --------------------------------------------------
+    // PC breakpoint via the debugger's bpnodes, armed in bridge mode: on hit
+    // the emu thread parks at the exact PC (no console) and a
+    // notifications/breakpoint frame is pushed. Resume with breakpoint_continue.
+    if (name == "breakpoint_set") {
+        uint32_t addr;
+        if (!obj_addr(js, toks, args_idx, "addr", addr))
+            return err("missing or invalid 'addr'");
+        int slot = -1;
+        for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+            if (!bpnodes[i].enabled) { slot = i; break; }
+        }
+        if (slot < 0) return err("all breakpoint slots in use");
+        bpnodes[slot].value1 = addr;
+        bpnodes[slot].value2 = 0;
+        bpnodes[slot].mask = 0xffffffff;
+        bpnodes[slot].type = BREAKPOINT_REG_PC;
+        bpnodes[slot].oper = BREAKPOINT_CMP_EQUAL;
+        bpnodes[slot].opersigned = false;
+        bpnodes[slot].cnt = 0;
+        bpnodes[slot].chain = -1;
+        bpnodes[slot].enabled = 1;
+        mcpbridge_breakpoints_arm(1);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "breakpoint %d set at 0x%x", slot, addr);
+        return ok_text(buf);
+    }
+
+    // -- breakpoint_clear -------------------------------------------------
+    if (name == "breakpoint_clear") {
+        int index = obj_int(js, toks, args_idx, "index", -1);
+        uint32_t addr = 0;
+        bool have_addr = obj_addr(js, toks, args_idx, "addr", addr);
+        int cleared = 0;
+        for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+            if (!bpnodes[i].enabled) continue;
+            bool match = (index < 0 && !have_addr) ||           // clear all
+                         (index >= 0 && i == index) ||
+                         (have_addr && bpnodes[i].value1 == addr);
+            if (match) { bpnodes[i].enabled = 0; cleared++; }
+        }
+        mcpbridge_breakpoints_arm(1);
+        // If the CPU is parked at a breakpoint, clearing implies resume —
+        // otherwise it would wait forever for a continue that has no
+        // breakpoint left to belong to.
+        bool resumed = false;
+        if (cleared && mcpbridge_break_state(NULL, NULL)) {
+            mcpbridge_break_continue();
+            resumed = true;
+        }
+        char buf[96];
+        snprintf(buf, sizeof(buf), "cleared %d breakpoint(s)%s", cleared,
+                 resumed ? ", resumed execution" : "");
+        return ok_text(buf);
+    }
+
+    // -- breakpoint_list ---------------------------------------------------
+    if (name == "breakpoint_list") {
+        uae_u32 hit_pc = 0; int hit_seq = 0;
+        int broken = mcpbridge_break_state(&hit_pc, &hit_seq);
+        std::string inner = "{\"stopped\":";
+        inner += broken ? "true" : "false";
+        if (broken) {
+            char pcb[32]; snprintf(pcb, sizeof(pcb), ",\"pc\":\"0x%x\"", hit_pc);
+            inner += pcb;
+        }
+        inner += ",\"breakpoints\":[";
+        bool first = true;
+        for (int i = 0; i < BREAKPOINT_TOTAL; i++) {
+            if (!bpnodes[i].enabled) continue;
+            char buf[96];
+            snprintf(buf, sizeof(buf), "%s{\"index\":%d,\"addr\":\"0x%x\"}",
+                     first ? "" : ",", i, bpnodes[i].value1);
+            inner += buf;
+            first = false;
+        }
+        inner += "]}";
+        std::string out = "{\"content\":[{\"type\":\"text\",\"text\":\"";
+        out += esc_json(inner);
+        out += "\"}]}";
+        return ok_raw(out);
+    }
+
+    // -- breakpoint_continue -----------------------------------------------
+    if (name == "breakpoint_continue") {
+        uae_u32 hit_pc = 0;
+        if (!mcpbridge_break_state(&hit_pc, NULL))
+            return err("not stopped at a breakpoint");
+        mcpbridge_break_continue();
+        char buf[64];
+        snprintf(buf, sizeof(buf), "resumed from 0x%x", hit_pc);
+        return ok_text(buf);
+    }
+
     // -- set_config ----------------------------------------------------
     if (name == "set_config") {
         // Accept either {"line":"key=value"} or {"key":"...","value":"..."}.
@@ -1130,10 +1390,20 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
         return ok_raw(out);
     }
 
-    // -- debug (queued, sync wait for output text) ----------------------
+    // -- debug (queued; runs direct when parked at a breakpoint) --------
     if (name == "debug") {
         std::string cmd = obj_str(js, toks, args_idx, "command");
         if (cmd.empty()) return err("missing 'command'");
+        if (mcpbridge_break_state(NULL, NULL)) {
+            // Emu thread is parked inside the breakpoint hook; the drain is
+            // not running. Call debug_parser directly (uaeipc does the same
+            // from its own thread).
+            std::wstring win = widen(cmd);
+            std::vector<wchar_t> wout(64 * 1024);
+            wout[0] = 0;
+            debug_parser(win.c_str(), wout.data(), (uae_u32)wout.size());
+            return ok_text(narrow(wout.data()));
+        }
         mcp_cmd c; c.kind = CMD_DEBUG; c.text = cmd;
         int rid = new_pending();
         c.reply_id = rid;
@@ -1147,13 +1417,21 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
         return ok_text(out_text);
     }
 
-    // -- disassemble (queued, sync wait) --------------------------------
+    // -- disassemble (queued; direct when parked at a breakpoint) -------
     if (name == "disassemble") {
         uint32_t addr;
         if (!obj_addr(js, toks, args_idx, "addr", addr))
             return err("missing or invalid 'addr'");
         int count = obj_int(js, toks, args_idx, "count", 16);
         if (count < 1 || count > 1024) return err("'count' must be 1..1024");
+        if (mcpbridge_break_state(NULL, NULL)) {
+            wchar_t cmdbuf[64];
+            _snwprintf(cmdbuf, 64, L"d %x %d", (unsigned)addr, count);
+            std::vector<wchar_t> wout(64 * 1024);
+            wout[0] = 0;
+            debug_parser(cmdbuf, wout.data(), (uae_u32)wout.size());
+            return ok_text(narrow(wout.data()));
+        }
         mcp_cmd c; c.kind = CMD_DISASSEMBLE; c.a = (int)addr; c.b = count;
         int rid = new_pending();
         c.reply_id = rid;
@@ -1535,7 +1813,31 @@ const char *TOOLS_LIST_JSON =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}},"
   "{\"name\":\"inject_event\","
     "\"description\":\"Fire any built-in WinUAE input event by config name: AKS_* action codes (e.g. AKS_ENTERGUI, AKS_SCREENSHOT_FILE, AKS_WARP, AKS_TOGGLEWINDOWEDFULLSCREEN), KEY_RAW_DOWN/KEY_RAW_UP (code in 'value'), or any event confname. 'value': '1'=on, '0'=off, empty=press.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"name\"]}}"
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"name\"]}},"
+  "{\"name\":\"serial_write\","
+    "\"description\":\"Send bytes to the guest's serial RX (as if a connected serial device transmitted them). 'text' for ASCII or 'data_b64' for binary. Max 200 bytes/call. Works without any host serial port configured.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"data_b64\":{\"type\":\"string\"}}}},"
+  "{\"name\":\"serial_read\","
+    "\"description\":\"Read bytes the guest transmitted over its serial port (captured even with no host serial device). Returns {count, data_b64, text}. Non-blocking unless 'timeout_ms' given (polls until first byte or timeout, max 30s).\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"max\":{\"type\":\"integer\"},\"timeout_ms\":{\"type\":\"integer\"}}}},"
+  "{\"name\":\"audio_levels\","
+    "\"description\":\"Snapshot of the four Paula audio channels: volume (0-64), period, length, active.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+  "{\"name\":\"audio_record\","
+    "\"description\":\"Record the mixed audio output for 'ms' milliseconds (50-5000). Returns metadata + a complete WAV file (16-bit stereo at the current sample rate) as base64 in a second text item. Silent/empty if sound is disabled or turbo is active.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"ms\":{\"type\":\"integer\"}}}},"
+  "{\"name\":\"breakpoint_set\","
+    "\"description\":\"Set a PC breakpoint at 'addr' (0xNN string). On hit, the CPU parks at the exact PC (sound paused, no debugger console) and a notifications/breakpoint frame is pushed. While stopped: get_cpu_state, memory_read, debug and disassemble all work. Resume with breakpoint_continue. Up to 20 slots.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"addr\":{\"type\":\"string\"}},\"required\":[\"addr\"]}},"
+  "{\"name\":\"breakpoint_clear\","
+    "\"description\":\"Clear breakpoints: by 'index', by 'addr', or ALL if neither given.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"index\":{\"type\":\"integer\"},\"addr\":{\"type\":\"string\"}}}},"
+  "{\"name\":\"breakpoint_list\","
+    "\"description\":\"List active breakpoints and whether the CPU is currently stopped at one (with the stop PC).\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+  "{\"name\":\"breakpoint_continue\","
+    "\"description\":\"Resume execution after a breakpoint stop.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
 "]}";
 
 const char *INIT_RESULT_JSON =
@@ -1696,6 +1998,45 @@ void writer_loop()
                 std::string("{\"alive\":") + (mh ? "true" : "false") + "}");
         }
         last_mh = mh;
+
+        // Screen mode change watcher: guest resolution / RTG transitions and
+        // host window-mode (windowed/fullwindow/fullscreen) switches.
+        // Interlace flicker jitters drawbuffer height by ~2px every few
+        // frames, so small height-only changes are ignored.
+        {
+            static int last_w = -1, last_h = -1, last_rtg = -1, last_fs = -1;
+            struct vidbuf_description *vid = &adisplays[0].gfxvidinfo;
+            int w = vid->drawbuffer.outwidth;
+            int h = vid->drawbuffer.outheight;
+            int rtg = adisplays[0].picasso_on ? 1 : 0;
+            int fs = currprefs.gfx_apmode[0].gfx_fullscreen;
+            bool significant =
+                (last_w >= 0) &&
+                (w != last_w || rtg != last_rtg || fs != last_fs ||
+                 (h > last_h ? h - last_h : last_h - h) > 8);
+            if (significant) {
+                char buf[160];
+                snprintf(buf, sizeof(buf),
+                         "{\"width\":%d,\"height\":%d,\"rtg\":%s,\"fullscreen_mode\":%d}",
+                         w, h, rtg ? "true" : "false", fs);
+                emit_notification("notifications/screen_mode_changed", buf);
+                last_w = w; last_h = h; last_rtg = rtg; last_fs = fs;
+            } else if (last_w < 0) {
+                last_w = w; last_h = h; last_rtg = rtg; last_fs = fs;
+            }
+        }
+
+        // Breakpoint hit watcher.
+        {
+            static int last_seq = 0;
+            uae_u32 pc = 0; int seq = 0;
+            if (mcpbridge_break_state(&pc, &seq) && seq != last_seq) {
+                char buf[96];
+                snprintf(buf, sizeof(buf), "{\"pc\":\"0x%x\",\"seq\":%d}", pc, seq);
+                emit_notification("notifications/breakpoint", buf);
+                last_seq = seq;
+            }
+        }
     }
 }
 
@@ -1773,6 +2114,30 @@ extern "C" void mcpbridge_init(int port)
     g_accept_thr.detach();
     g_writer_thr = std::thread(writer_loop);
     g_writer_thr.detach();
+}
+
+// Tap: called from serial_win32.cpp's checksend() with every byte the guest
+// transmits over the serial port. Receiver thread reads via serial_read.
+void mcpbridge_serial_tx(int c)
+{
+    std::lock_guard<std::mutex> g(g_ser_mtx);
+    if (g_ser_tx.size() >= SER_TX_CAP)
+        g_ser_tx.pop_front();
+    g_ser_tx.push_back((uint8_t)(c & 0xff));
+}
+
+// Tap: called from finish_sound_buffer() with each mixed Paula buffer.
+// Only copies while a recording is in progress.
+void mcpbridge_audio_tap(const uae_u8 *data, int bytes)
+{
+    if (!g_audio_capturing.load(std::memory_order_relaxed))
+        return;
+    if (!data || bytes <= 0)
+        return;
+    std::lock_guard<std::mutex> g(g_audio_mtx);
+    if (g_audio_buf.size() + (size_t)bytes > AUDIO_CAP)
+        return;
+    g_audio_buf.insert(g_audio_buf.end(), data, data + bytes);
 }
 
 extern "C" void mcpbridge_shutdown(void)
@@ -1904,6 +2269,18 @@ extern "C" void mcpbridge_drain(void)
             std::wstring wval = widen(val);
             int r = inputdevice_uaelib(wev.c_str(), wval.c_str());
             if (c.reply_id) deliver_pending(c.reply_id, r ? "1" : "0");
+            break;
+        }
+        case CMD_SERIAL_WRITE: {
+            int fed = 0;
+            for (unsigned char b : c.text) {
+                if (!serreceive_external((uae_u16)b))
+                    break;
+                fed++;
+            }
+            char buf[64];
+            snprintf(buf, sizeof(buf), "fed %d of %zu byte(s)", fed, c.text.size());
+            if (c.reply_id) deliver_pending(c.reply_id, buf);
             break;
         }
         case CMD_SCREENSHOT: {
