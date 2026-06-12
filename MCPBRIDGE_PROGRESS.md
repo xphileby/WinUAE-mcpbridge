@@ -364,8 +364,26 @@ reply, per JSON-RPC spec).
 stderr; Claude Desktop surfaces MCP-server stderr in its log panel.
 
 ### Step 9 — Tier-2 misc (lower priority, on demand)
-`breakpoint_set/clear`, `set_speed`, `mount_dir`, `inject_event`,
-`serial_read/write`, `audio_levels/record`.
+DONE: `set_speed`, `mount_dir`, `inject_event`, `get_config`.
+Remaining: `breakpoint_set/clear` (+ on_break notification),
+`serial_read/write`, `audio_levels/record`, screen-mode-change notification.
+
+Notes from implementing the step-9 batch (all three verified live):
+- `mount_dir` uses `filesys_media_change(dir, 2, NULL)` — the drag&drop
+  insert path. Queued to the emu thread; volume name auto-derives from the
+  directory name and the icon appears on the Workbench desktop within ~1s.
+  Requires the guest FS to be up (booted Workbench). Verified visually
+  (mcptest_dir icon appeared; +780 bytes of PNG).
+- `inject_event` wraps `inputdevice_uaelib(name, value)` (queued):
+  handles AKS_* action codes, KEY_RAW_DOWN/UP, and any inputevents.def
+  confname. value: "1" on, "0" off, empty press. Unknown names error.
+- `get_config` replicates the uaeipc query loop over `cfgfile_modify`
+  (index=-1 to set the search, then 0.. to fetch). EXACT option names only —
+  prefix search returns nothing. Runs on the receiver thread like uaeipc.
+- Known wart: jsmn token strings are not backslash-unescaped, so JSON paths
+  arrive with literal `\\`. Windows path APIs tolerate doubled separators,
+  which is why mount_dir/save_state work anyway. A proper unescape pass in
+  obj_str would clean this up.
 
 ## Open design decisions made (and why)
 

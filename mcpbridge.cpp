@@ -26,6 +26,7 @@
 #include "memory.h"
 #include "newcpu.h"
 #include "debug.h"
+#include "autoconf.h"
 #include "mcpbridge.h"
 
 // jsmn: include once with JSMN_STATIC so functions are file-local.
@@ -79,6 +80,8 @@ enum cmd_kind {
     CMD_DEBUG,               // text=command; reply via pending_reply
     CMD_DISASSEMBLE,         // a=addr, b=count; reply via pending_reply
     CMD_SCREENSHOT,          // a=imagemode (0=host, 1=native); reply via pending_reply
+    CMD_MOUNT_DIR,           // text=host dir; reply via pending_reply
+    CMD_INJECT_EVENT,        // text=name + '\n' + value; reply via pending_reply
 };
 
 struct mcp_cmd {
@@ -969,6 +972,83 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
         return ok_raw(out);
     }
 
+    // -- get_config ------------------------------------------------------
+    // Query current config via cfgfile_modify's search protocol (same path
+    // uaeipc and uae-configuration use). 'key' may be a full option name or
+    // a prefix; all matching "key=value" lines are returned.
+    if (name == "get_config") {
+        std::string key = obj_str(js, toks, args_idx, "key");
+        if (key.empty()) return err("missing 'key'");
+        std::wstring wkey = widen(key);
+        TCHAR tmpout[512];
+        std::string acc;
+        uae_u32 index = 0xffffffff;
+        for (int guard = 0; guard < 256; ++guard) {
+            tmpout[0] = 0;
+            uae_u32 ret = cfgfile_modify(index, wkey.c_str(), (uae_u32)wkey.size(),
+                                         tmpout, sizeof(tmpout) / sizeof(TCHAR));
+            index++;
+            if (tmpout[0]) {
+                if (!acc.empty()) acc += "\n";
+                acc += narrow(tmpout);
+            }
+            if (ret != 0xffffffff) break;
+        }
+        if (acc.empty()) return err("no matching config key: " + key, -32602);
+        return ok_text(acc);
+    }
+
+    // -- mount_dir -------------------------------------------------------
+    // Mount a host directory as a guest volume at runtime (the same code
+    // path WinUAE uses for drag&drop). Volume name is auto-derived from the
+    // directory name. Requires the guest filesystem to be up (Workbench
+    // booted). Queued to the emu thread; blocks for the result.
+    if (name == "mount_dir") {
+        std::string path = obj_str(js, toks, args_idx, "path");
+        if (path.empty()) return err("missing 'path'");
+        DWORD attr = GetFileAttributesA(path.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+            return err("host directory does not exist: " + path);
+        mcp_cmd c; c.kind = CMD_MOUNT_DIR; c.text = path;
+        int rid = new_pending();
+        c.reply_id = rid;
+        enqueue(std::move(c));
+        std::string out_text;
+        if (!wait_pending(rid, out_text, 10000)) {
+            drop_pending(rid);
+            return err("mount_dir timed out");
+        }
+        drop_pending(rid);
+        if (out_text.rfind("ok", 0) != 0)
+            return err("mount failed: " + out_text);
+        return ok_text(out_text + " (volume name derives from the directory name; it appears on Workbench within a second)");
+    }
+
+    // -- inject_event ----------------------------------------------------
+    // Fire any built-in input event by config name: AKS_* action codes
+    // (AKS_ENTERGUI, AKS_TOGGLEWINDOWEDFULLSCREEN, AKS_FREEZEBUTTON, ...),
+    // KEY_RAW_DOWN/KEY_RAW_UP with a code in 'value', or any event confname
+    // from inputevents.def. 'value': "1"=on, "0"=off, empty/other=press.
+    if (name == "inject_event") {
+        std::string ev = obj_str(js, toks, args_idx, "name");
+        if (ev.empty()) return err("missing 'name'");
+        std::string val = obj_str(js, toks, args_idx, "value");
+        mcp_cmd c; c.kind = CMD_INJECT_EVENT;
+        c.text = ev + "\n" + val;
+        int rid = new_pending();
+        c.reply_id = rid;
+        enqueue(std::move(c));
+        std::string out_text;
+        if (!wait_pending(rid, out_text, 10000)) {
+            drop_pending(rid);
+            return err("inject_event timed out");
+        }
+        drop_pending(rid);
+        if (out_text != "1")
+            return err("unknown event name: " + ev, -32602);
+        return ok_text("event fired: " + ev);
+    }
+
     // -- set_config ----------------------------------------------------
     if (name == "set_config") {
         // Accept either {"line":"key=value"} or {"key":"...","value":"..."}.
@@ -1446,7 +1526,16 @@ const char *TOOLS_LIST_JSON =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"timeout_ms\":{\"type\":\"integer\"},\"quiet_ms\":{\"type\":\"integer\"}}}},"
   "{\"name\":\"set_speed\","
     "\"description\":\"Set CPU emulation speed. mode: 'turbo' (frame-uncapped fast-forward), 'max' (run at host speed, no throttle), 'original' (cycle-accurate 68000 timing), 'balanced' (default mixed mode).\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"turbo\",\"max\",\"original\",\"balanced\"]}},\"required\":[\"mode\"]}}"
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"turbo\",\"max\",\"original\",\"balanced\"]}},\"required\":[\"mode\"]}},"
+  "{\"name\":\"get_config\","
+    "\"description\":\"Read a current config value. 'key' must be the EXACT option name as it appears in a .uae config file (e.g. 'gfx_fullscreen_amiga', 'chipmem_size', 'cpu_model'); returns the live value. Prefix matching is NOT supported.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"]}},"
+  "{\"name\":\"mount_dir\","
+    "\"description\":\"Mount a host directory as a guest volume at runtime (same mechanism as drag&drop). Volume name derives from the directory name and appears on Workbench within ~1s. Requires the guest OS to be booted. Great for getting cross-compiled binaries into the guest without rebuilding the HDF.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}},"
+  "{\"name\":\"inject_event\","
+    "\"description\":\"Fire any built-in WinUAE input event by config name: AKS_* action codes (e.g. AKS_ENTERGUI, AKS_SCREENSHOT_FILE, AKS_WARP, AKS_TOGGLEWINDOWEDFULLSCREEN), KEY_RAW_DOWN/KEY_RAW_UP (code in 'value'), or any event confname. 'value': '1'=on, '0'=off, empty=press.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"name\"]}}"
 "]}";
 
 const char *INIT_RESULT_JSON =
@@ -1787,6 +1876,34 @@ extern "C" void mcpbridge_drain(void)
             debug_parser(cmdbuf, wout.data(), (uae_u32)outsz);
             std::string out = narrow(wout.data());
             if (c.reply_id) deliver_pending(c.reply_id, out);
+            break;
+        }
+        case CMD_MOUNT_DIR: {
+            std::wstring w = widen(c.text);
+            // 2 = drag&drop-style insert: creates a new removable unit (or
+            // reuses an empty slot) and signals the guest mounter task.
+            int nr = filesys_media_change(w.c_str(), 2, NULL);
+            std::string out;
+            if (nr > 0) {
+                char buf[96];
+                snprintf(buf, sizeof(buf), "ok unit=%d", nr >= 100 ? nr - 100 : nr);
+                out = buf;
+            } else if (nr == -1) {
+                out = "mounter busy, retry shortly";
+            } else {
+                out = "filesystem not ready (guest not booted?) or mount rejected";
+            }
+            if (c.reply_id) deliver_pending(c.reply_id, out);
+            break;
+        }
+        case CMD_INJECT_EVENT: {
+            size_t nl = c.text.find('\n');
+            std::string ev = c.text.substr(0, nl);
+            std::string val = (nl == std::string::npos) ? "" : c.text.substr(nl + 1);
+            std::wstring wev = widen(ev);
+            std::wstring wval = widen(val);
+            int r = inputdevice_uaelib(wev.c_str(), wval.c_str());
+            if (c.reply_id) deliver_pending(c.reply_id, r ? "1" : "0");
             break;
         }
         case CMD_SCREENSHOT: {
