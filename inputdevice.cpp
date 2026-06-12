@@ -2510,6 +2510,24 @@ static uaecptr get_intuitionbase (void)
 		magicmouse_ibase = get_base("intuition.library");
 	return magicmouse_ibase;
 }
+// Read the live Intuition pointer position (screen pixel coords) for the
+// mcpbridge. Mode-independent: this is Intuition's own notion of where the
+// pointer is, so it stays valid across resolution / interlace changes.
+// Returns true and fills *xp/*yp on success.
+bool mcpbridge_get_pointer_pos(int *xp, int *yp)
+{
+	uaecptr ib = get_intuitionbase();
+	if (!ib)
+		return false;
+	if (get_word(ib + 20) < 31) // IntuitionBase version < 31: no MouseX/Y
+		return false;
+	int x = (uae_s16)get_word(ib + 70);
+	int y = (uae_s16)get_word(ib + 68);
+	if (xp) *xp = x;
+	if (yp) *yp = y;
+	return true;
+}
+
 static uaecptr get_gfxbase (void)
 {
 	if (magicmouse_gfxbase == 0xffffffff)

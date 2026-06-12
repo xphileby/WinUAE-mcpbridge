@@ -146,6 +146,74 @@ std::thread g_accept_thr;
 std::mutex g_q_mtx;
 std::deque<mcp_cmd> g_q;
 
+// ---------------------------------------------------------------------------
+// Paced mouse action queue.
+//
+// Why this exists: without the guest-side mousehack, pointer motion happens
+// through the emulated 8-bit MOUSE0DAT hardware counters. The AmigaOS mouse
+// driver reads them once per vsync and interprets the difference as signed
+// 8-bit, so more than ~127 counts accumulated within one frame alias (e.g.
+// +200 reads back as -56). The drain below therefore emits at most one small
+// chunk (MOUSE_CHUNK) per drain tick. maybe_read_input() fires the drain up
+// to ~3x per frame, so 3 * MOUSE_CHUNK must stay below 127.
+//
+// Button events go through the same queue so a click queued after a motion
+// executes only once the pointer has arrived. delay_ticks spaces button
+// transitions far enough apart that the guest's per-vsync input poll is
+// guaranteed to observe each state.
+// ---------------------------------------------------------------------------
+
+#define MOUSE_CHUNK 40
+
+struct mouse_action {
+    int kind;        // 0 = relative motion, 1 = button event
+    int dx = 0, dy = 0;          // motion remainder
+    int button = 0, state = 0;   // button event
+    int delay_ticks = 0;         // ticks to wait before this action runs
+    int reply_id = 0;            // pending-reply delivered when action completes
+};
+std::deque<mouse_action> g_mouse_q;   // guarded by g_q_mtx
+
+void enqueue_mouse(mouse_action &&a)
+{
+    std::lock_guard<std::mutex> g(g_q_mtx);
+    g_mouse_q.emplace_back(std::move(a));
+}
+
+// One tick of the mouse engine; called from mcpbridge_drain on the emu thread.
+void mouse_engine_tick()
+{
+    int finished_reply = 0;
+    {
+        std::unique_lock<std::mutex> lk(g_q_mtx, std::try_to_lock);
+        if (!lk.owns_lock() || g_mouse_q.empty())
+            return;
+        mouse_action &a = g_mouse_q.front();
+        if (a.delay_ticks > 0) {
+            a.delay_ticks--;
+            return;
+        }
+        if (a.kind == 0) {
+            int sx = a.dx > MOUSE_CHUNK ? MOUSE_CHUNK : (a.dx < -MOUSE_CHUNK ? -MOUSE_CHUNK : a.dx);
+            int sy = a.dy > MOUSE_CHUNK ? MOUSE_CHUNK : (a.dy < -MOUSE_CHUNK ? -MOUSE_CHUNK : a.dy);
+            if (sx) setmousestate(0, 0, sx, 0);
+            if (sy) setmousestate(0, 1, sy, 0);
+            a.dx -= sx;
+            a.dy -= sy;
+            if (a.dx == 0 && a.dy == 0) {
+                finished_reply = a.reply_id;
+                g_mouse_q.pop_front();
+            }
+        } else {
+            setmousebuttonstate(0, a.button, a.state);
+            finished_reply = a.reply_id;
+            g_mouse_q.pop_front();
+        }
+    }
+    if (finished_reply)
+        deliver_pending(finished_reply, "done");
+}
+
 // Writer side: all socket sends funnel through this thread so responses and
 // spontaneous notifications never interleave at the byte level. The active
 // socket pointer is set by handle_client on connect, cleared on disconnect.
@@ -538,47 +606,159 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
         return ok_text(buf);
     }
 
+    // -- get_pointer_pos -------------------------------------------------
+    // Live Intuition pointer position (guest screen pixels). Mode-independent.
+    if (name == "get_pointer_pos") {
+        int px = 0, py = 0;
+        bool ok = mcpbridge_get_pointer_pos(&px, &py);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "{\"available\":%s,\"x\":%d,\"y\":%d}",
+                 ok ? "true" : "false", px, py);
+        std::string out = "{\"content\":[{\"type\":\"text\",\"text\":\"";
+        out += esc_json(buf);
+        out += "\"}]}";
+        return ok_raw(out);
+    }
+
     // -- mouse_move ------------------------------------------------------
+    // space:'host' (default): true absolute positioning in Intuition screen
+    // pixels via CLOSED LOOP — reads the live pointer position and corrects,
+    // so it is immune to resolution / interlace / centering changes. Falls
+    // back to open-loop pin+walk if Intuition position is unavailable.
+    // space:'amiga': legacy direct rtarea write (needs mousehack alive).
     if (name == "mouse_move") {
         int x = obj_int(js, toks, args_idx, "x", INT_MIN);
         int y = obj_int(js, toks, args_idx, "y", INT_MIN);
         if (x == INT_MIN || y == INT_MIN) return err("require 'x' and 'y'");
         std::string space = obj_str(js, toks, args_idx, "space");
-        mcp_cmd c;
-        c.kind = (space == "host") ? CMD_MOUSE_MOVE_HOST : CMD_MOUSE_MOVE_AMIGA;
-        c.a = x; c.b = y;
-        enqueue(std::move(c));
-        char buf[96];
-        snprintf(buf, sizeof(buf), "queued mouse_move x=%d y=%d space=%s",
-                 x, y, (space == "host") ? "host" : "amiga");
+        if (space == "amiga") {
+            mcp_cmd c;
+            c.kind = CMD_MOUSE_MOVE_AMIGA;
+            c.a = x; c.b = y;
+            enqueue(std::move(c));
+            char buf[96];
+            snprintf(buf, sizeof(buf), "queued mouse_move x=%d y=%d space=amiga", x, y);
+            return ok_text(buf);
+        }
+        if (x < 0 || x > 4096 || y < 0 || y > 4096)
+            return err("'x'/'y' must be 0..4096");
+
+        int cx, cy;
+        bool have_pos = mcpbridge_get_pointer_pos(&cx, &cy);
+        if (have_pos) {
+            // Closed loop. After each correction we settle ~30ms so Intuition's
+            // input interrupt has updated MouseX/Y before we re-read (otherwise
+            // a stale read looks like non-convergence). Stops on exact hit,
+            // when within 1px, or when two settled reads stop improving.
+            int prev_err = INT_MAX;
+            int stuck = 0;
+            for (int pass = 0; pass < 10; ++pass) {
+                int dx = x - cx, dy = y - cy;
+                if (dx == 0 && dy == 0) break;
+                int rid = new_pending();
+                { mouse_action a; a.kind = 0; a.dx = dx; a.dy = dy; a.reply_id = rid; enqueue_mouse(std::move(a)); }
+                std::string done;
+                if (!wait_pending(rid, done, 30000)) { drop_pending(rid); return err("mouse_move timed out"); }
+                drop_pending(rid);
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                if (!mcpbridge_get_pointer_pos(&cx, &cy)) break;
+                int err_now = abs(x - cx) + abs(y - cy);
+                if (err_now <= 1) break;
+                if (err_now >= prev_err) { if (++stuck >= 2) break; }
+                else stuck = 0;
+                prev_err = err_now;
+            }
+            char buf[96];
+            snprintf(buf, sizeof(buf), "pointer at (%d,%d), target (%d,%d)", cx, cy, x, y);
+            return ok_text(buf);
+        }
+
+        // Open-loop fallback: pin to corner then walk.
+        int rid = new_pending();
+        { mouse_action a; a.kind = 0; a.dx = -2400; a.dy = -2400; enqueue_mouse(std::move(a)); }
+        { mouse_action a; a.kind = 0; a.dx = x; a.dy = y; a.reply_id = rid; enqueue_mouse(std::move(a)); }
+        std::string done;
+        if (!wait_pending(rid, done, 30000)) { drop_pending(rid); return err("mouse_move did not complete"); }
+        drop_pending(rid);
+        char buf[112];
+        snprintf(buf, sizeof(buf), "pointer ~(%d,%d) (open-loop; Intuition pos unavailable)", x, y);
+        return ok_text(buf);
+    }
+
+    // -- mouse_move_rel ---------------------------------------------------
+    // Paced relative motion; blocks until the full delta has been applied.
+    if (name == "mouse_move_rel") {
+        int dx = obj_int(js, toks, args_idx, "dx", 0);
+        int dy = obj_int(js, toks, args_idx, "dy", 0);
+        if (dx == 0 && dy == 0) return err("provide non-zero 'dx' and/or 'dy'");
+        if (dx < -4096 || dx > 4096 || dy < -4096 || dy > 4096)
+            return err("'dx'/'dy' must be -4096..4096");
+        int rid = new_pending();
+        { mouse_action a; a.kind = 0; a.dx = dx; a.dy = dy; a.reply_id = rid; enqueue_mouse(std::move(a)); }
+        std::string done;
+        if (!wait_pending(rid, done, 30000)) {
+            drop_pending(rid);
+            return err("mouse_move_rel did not complete (is emulation running?)");
+        }
+        drop_pending(rid);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "moved by (%d,%d)", dx, dy);
         return ok_text(buf);
     }
 
     // -- mouse_button ----------------------------------------------------
+    // Routed through the mouse queue so it executes AFTER any queued motion.
     if (name == "mouse_button") {
         int button = obj_int(js, toks, args_idx, "button", 0);
         int state  = obj_int(js, toks, args_idx, "state", -1);
         if (state != 0 && state != 1) return err("'state' must be 0 (up) or 1 (down)");
         if (button < 0 || button > 7) return err("'button' out of range");
-        mcp_cmd c; c.kind = CMD_MOUSE_BUTTON; c.a = button; c.b = state;
-        enqueue(std::move(c));
+        int rid = new_pending();
+        { mouse_action a; a.kind = 1; a.button = button; a.state = state; a.reply_id = rid; enqueue_mouse(std::move(a)); }
+        std::string done;
+        if (!wait_pending(rid, done, 15000)) {
+            drop_pending(rid);
+            return err("mouse_button did not complete");
+        }
+        drop_pending(rid);
         char buf[64];
-        snprintf(buf, sizeof(buf), "queued mouse_button b=%d s=%d", button, state);
+        snprintf(buf, sizeof(buf), "button %d %s", button, state ? "down" : "up");
         return ok_text(buf);
     }
 
     // -- mouse_click -----------------------------------------------------
+    // Paced press/release pairs; delay_ticks guarantees the guest's
+    // per-vsync poll observes every transition. Blocks until the last
+    // release has executed.
     if (name == "mouse_click") {
         int button = obj_int(js, toks, args_idx, "button", 0);
         int count  = obj_int(js, toks, args_idx, "count", 1);
         if (button < 0 || button > 7) return err("'button' out of range");
-        if (count < 1 || count > 16)  return err("'count' must be 1..16");
+        if (count < 1 || count > 4)   return err("'count' must be 1..4");
+        // Tunable pacing (ticks; ~6.7ms each). press = button-down duration,
+        // gap = up-to-next-down spacing within a multi-click.
+        int press_t = obj_int(js, toks, args_idx, "press_ticks", 6);
+        int gap_t   = obj_int(js, toks, args_idx, "gap_ticks", 6);
+        if (press_t < 1) press_t = 1; if (press_t > 60) press_t = 60;
+        if (gap_t < 1) gap_t = 1;     if (gap_t > 60) gap_t = 60;
+        int rid = new_pending();
         for (int i = 0; i < count; ++i) {
-            mcp_cmd d; d.kind = CMD_MOUSE_BUTTON; d.a = button; d.b = 1; enqueue(std::move(d));
-            mcp_cmd u; u.kind = CMD_MOUSE_BUTTON; u.a = button; u.b = 0; enqueue(std::move(u));
+            mouse_action d; d.kind = 1; d.button = button; d.state = 1;
+            d.delay_ticks = (i == 0) ? 0 : gap_t;   // gap between clicks
+            enqueue_mouse(std::move(d));
+            mouse_action u; u.kind = 1; u.button = button; u.state = 0;
+            u.delay_ticks = press_t;                // press duration
+            if (i == count - 1) u.reply_id = rid;
+            enqueue_mouse(std::move(u));
         }
+        std::string done;
+        if (!wait_pending(rid, done, 15000)) {
+            drop_pending(rid);
+            return err("mouse_click did not complete");
+        }
+        drop_pending(rid);
         char buf[64];
-        snprintf(buf, sizeof(buf), "queued %d click(s) on button %d", count, button);
+        snprintf(buf, sizeof(buf), "%d click(s) on button %d done", count, button);
         return ok_text(buf);
     }
 
@@ -1166,13 +1346,19 @@ const char *TOOLS_LIST_JSON =
     "\"description\":\"Type ASCII text into the running Amiga via keybuf_inject. Only chars representable on the US Amiga keyboard work; newline = Return.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}},"
   "{\"name\":\"mouse_move\","
-    "\"description\":\"Move the pointer. space='amiga' (default) writes Amiga chip-coord absolute position via the mousehack rtarea region and ONLY visibly moves the pointer if mousehack_status reports mousehack_alive=1 (i.e. the guest has the magic-mouse handler active). space='host' uses host window pixels via the standard delta path; works whenever a mouse is bound to a joyport.\","
+    "\"description\":\"Move the pointer to absolute Intuition SCREEN PIXEL coordinates (0,0 = screen top-left, same coordinate space as get_pointer_pos). CLOSED-LOOP: reads the live pointer position and self-corrects, so it is accurate regardless of resolution/interlace/centering. BLOCKS until arrived. (space='amiga' selects the legacy rtarea path that needs mousehack alive; the default/host path is recommended.)\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},\"space\":{\"type\":\"string\",\"enum\":[\"amiga\",\"host\"]}},\"required\":[\"x\",\"y\"]}},"
+  "{\"name\":\"get_pointer_pos\","
+    "\"description\":\"Returns the live Intuition pointer position {available, x, y} in screen pixels. Mode-independent. Use to verify mouse_move or to locate the pointer before a relative move.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+  "{\"name\":\"mouse_move_rel\","
+    "\"description\":\"Move the pointer by a relative delta in guest pixels. Vsync-paced (no 8-bit counter aliasing); blocks until the full delta has been applied.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"dx\":{\"type\":\"integer\"},\"dy\":{\"type\":\"integer\"}},\"required\":[\"dx\",\"dy\"]}},"
   "{\"name\":\"mouse_button\","
-    "\"description\":\"Press or release a mouse button. button: 0=left, 1=right, 2=middle. state: 1=down, 0=up.\","
+    "\"description\":\"Press or release a mouse button. button: 0=left, 1=right, 2=middle. state: 1=down, 0=up. Executes after any queued pointer motion; blocks until applied.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"button\":{\"type\":\"integer\"},\"state\":{\"type\":\"integer\"}},\"required\":[\"button\",\"state\"]}},"
   "{\"name\":\"mouse_click\","
-    "\"description\":\"Single click (or N clicks back-to-back) of the given button. Useful for double-clicks via count=2.\","
+    "\"description\":\"Click (or N clicks, count<=4) of the given button. Press/release transitions are vsync-paced so the guest reliably observes each one; count=2 produces a guest-recognized double-click. Blocks until done.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"button\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"}}}},"
   "{\"name\":\"mouse_scroll\","
     "\"description\":\"Mouse wheel delta. dy = vertical, dx = horizontal. Use multiples of 120 for one notch.\","
@@ -1513,6 +1699,10 @@ extern "C" void mcpbridge_drain(void)
 {
     if (!g_running.load(std::memory_order_relaxed)) return;
 
+    // One paced step of the mouse engine per drain tick (see comments at
+    // the mouse_action queue for the 8-bit counter aliasing rationale).
+    mouse_engine_tick();
+
     std::deque<mcp_cmd> local;
     {
         std::unique_lock<std::mutex> lk(g_q_mtx, std::try_to_lock);
@@ -1530,12 +1720,9 @@ extern "C" void mcpbridge_drain(void)
             inputdevice_mh_abs(c.a, c.b, mousehack_alive() ? 0 : 0);
             break;
         case CMD_MOUSE_MOVE_HOST:
-            // X first, then Y; Y triggers mousehack_helper() inside setmousestate.
-            setmousestate(0, 0, c.a, 1);
-            setmousestate(0, 1, c.b, 1);
-            break;
         case CMD_MOUSE_BUTTON:
-            setmousebuttonstate(0, c.a, c.b);
+            // Superseded by the paced mouse_action queue; kept for ABI
+            // stability of the enum only.
             break;
         case CMD_MOUSE_SCROLL:
             if (c.a) setmousestate(0, 3, c.a, 0);   // horizontal wheel
@@ -1645,10 +1832,20 @@ extern "C" void mcpbridge_drain(void)
                     currprefs.input_tablet     = n;
                 }
             }
+            // gfx_* options are applied by the main loop's
+            // check_prefs_changed_gfx() which DIFFS changed_prefs against
+            // currprefs — writing both would erase the diff and the change
+            // would never apply (e.g. fullscreen switching). Everything else
+            // goes to both structs so read-mostly fields update immediately.
+            bool gfx_key = c.text.rfind("gfx_", 0) == 0;
             cfgfile_parse_line(&changed_prefs, const_cast<wchar_t *>(w.c_str()), 0);
-            cfgfile_parse_line(&currprefs,     const_cast<wchar_t *>(w.c_str()), 0);
+            if (!gfx_key) {
+                cfgfile_parse_line(&currprefs, const_cast<wchar_t *>(w.c_str()), 0);
+            }
             set_config_changed();
-            inputdevice_updateconfig(&changed_prefs, &currprefs);
+            if (!gfx_key) {
+                inputdevice_updateconfig(&changed_prefs, &currprefs);
+            }
             emit_notification("notifications/config_changed",
                 std::string("{\"line\":\"") + esc_json(c.text) + "\"}");
             break;

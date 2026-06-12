@@ -143,7 +143,52 @@ apply to tag 6030 — re-verify after checkout)
 - `set_config magic_mouse=false` flipped the field through `cfgfile_parse_line`
 - `disk_list` returned `{drives:[{drive:0,path:"",type:-1},...]}`
 
-## Mouse control findings (verified by driving Workbench mouse-only)
+## Mouse control v2 — closed-loop engine (current, verified all display modes)
+
+The fragile fixed-offset approach below was replaced by a **closed-loop**
+engine that is accurate to **0 px** and **display-mode-independent**.
+
+Key pieces:
+- `mcpbridge_get_pointer_pos()` (inputdevice.cpp): reads Intuition's live
+  pointer position (IntuitionBase->MouseX @ +70, MouseY @ +68 via
+  get_intuitionbase()). This is the guest's OWN screen-pixel coordinate, so
+  it stays correct across resolution / interlace / centering / fullscreen
+  changes. Exposed as the `get_pointer_pos` tool.
+- A vsync-paced **mouse_action queue** drained one small chunk per
+  `mcpbridge_drain()` tick (MOUSE_CHUNK=40), so accumulated motion never
+  exceeds the ~127-count signed-8-bit aliasing limit of MOUSE0DAT.
+- `mouse_move {x,y}` is now **absolute in Intuition screen pixels** and
+  **closed-loop**: it reads the live pointer, moves by the delta, settles
+  ~30 ms (so Intuition's input interrupt updates MouseX/Y before the
+  re-read — skipping this settle makes a stale read look like
+  non-convergence), and repeats up to 10 passes until within 1 px. Blocks
+  until done.
+- `mouse_move_rel {dx,dy}`: paced relative motion, blocks until applied.
+- `mouse_button` / `mouse_click` go through the same queue so they execute
+  *after* queued motion; clicks are vsync-paced (press_ticks/gap_ticks,
+  default 6/6 ≈ 40 ms each) so the guest's per-vsync poll observes every
+  transition. count=2 yields a guest-recognized double-click.
+
+**Critical finding:** the earlier "double-click only selects, never opens"
+problem was NOT a timing issue — it was *positioning*. The open-loop walk
+landed a few px off the icon's open-hotspot (enough to select on the looser
+hitbox but not open). With closed-loop 0-px targeting, count=2 reliably
+opens icons.
+
+**Verified (0 px error + Workbench window opens via double-click) in:**
+- windowed (`gfx_fullscreen_amiga=false`)
+- maximized / borderless (`gfx_fullscreen_amiga=fullwindow`)
+- exclusive fullscreen (`gfx_fullscreen_amiga=true`)
+
+Switching modes at runtime works via `set_config gfx_fullscreen_amiga=...`;
+the set_config drain special-cases `gfx_*` keys to write changed_prefs only
+(currprefs is updated by the main loop's check_prefs_changed_gfx diff —
+writing both would erase the diff and the mode switch would never apply).
+
+The fixed-offset notes below are retained for historical context only; the
+closed loop makes the (54,28) origin and ≤50-step pacing rules unnecessary.
+
+## (historical) Mouse control findings — fixed-offset, mousehack-off
 
 Tested end-to-end by opening Workbench disk → Prefs drawer → Input editor
 using only `mouse_move` + `mouse_button` (no keyboard). See
