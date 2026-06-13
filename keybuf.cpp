@@ -348,6 +348,14 @@ void keybuf_ignore_next_release(void)
 	ignore_next_release = true;
 }
 
+// mcpbridge: is a previous keybuf_inject still draining (or a key from it
+// awaiting its release event)? The bridge's keyboard serializer polls this
+// to avoid submitting a new injection that would xfree the active buffer.
+int keybuf_inject_active(void)
+{
+	return (keyinject != NULL) || keyinject_state;
+}
+
 void keybuf_inject(const uae_char *txt)
 {
 	uae_char *newbuf = xmalloc(uae_char, strlen(txt) + 1);

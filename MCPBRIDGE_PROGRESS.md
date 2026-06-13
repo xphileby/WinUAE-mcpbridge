@@ -225,7 +225,39 @@ Future bridge improvement: add a real `mouse_move_rel(dx,dy)` tool that
 chunks + paces inside the drain (one chunk per vsync), and make
 `space:'host'` truly absolute by doing pin+walk internally.
 
-## type_text / key input serialization bug (found during full verification)
+## Keyboard serializer (FIXES the type_text bug below)
+
+The garbling described below is fixed by a bridge-side keyboard serializer
+that mirrors the mouse engine. keybuf.cpp exposes `keybuf_inject_active()`
+(true while a keyinject buffer is draining or a key from it awaits release).
+mcpbridge runs a `key_action` queue stepped from the drain tick:
+- A text item is handed to keybuf_inject only once the previous injection has
+  fully drained, then waits for ITS drain before completing.
+- A raw key event also waits for any in-flight text (never interleaves).
+- type_text / key_down / key_up / key_press now BLOCK until the guest has
+  consumed the input, with the reply delivered from the drain. key_press
+  builds its full down/up sequence and pushes it under one lock so the reply
+  lands on the final action with no race.
+
+Result: clients can fire keyboard tools back-to-back with ZERO inter-call
+delays and get correct sequencing. Verified end-to-end with the previously-
+failing flow, no client sleeps: key_press(RAmiga+E), type_text("newshell"),
+key_press(Return), then type_text("echo >SER: HELLO_AMIGA"), key_press(Return)
+-> serial_read captured exactly "HELLO_AMIGA\n" (the guest parsed and executed
+the typed command and transmitted it). This also closes the serial guest->host
+verification gap.
+
+## winuae_status relay tool + connection notifications
+
+The relay advertises a relay-LOCAL tool `winuae_status` (always in tools/list)
+that reports {connected, host, port, seconds_since_change, tools_cached}
+WITHOUT touching the emulator — so a client can check reachability before
+firing real actions. The relay also emits notifications/winuae_connected and
+notifications/winuae_disconnected on transitions. Verified: connected:true
+with WinUAE up, connected:false with it down, both answered by the relay
+alone.
+
+## (historical) type_text / key input serialization bug
 
 `keybuf_inject` (keybuf.cpp) uses a SINGLE `keyinject` buffer drained one key
 per vsync, and each new call `xfree`s whatever was still draining. Plus

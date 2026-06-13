@@ -236,6 +236,78 @@ std::condition_variable g_send_cv;
 std::thread g_writer_thr;
 
 // ---------------------------------------------------------------------------
+// Keyboard serializer.
+//
+// Why this exists: keybuf_inject() uses a single engine-side buffer drained
+// one character per keyboard poll, and a NEW call xfrees the buffer that is
+// still draining. Raw key events (record_key_direct) use a separate ring
+// that interleaves with the inject drain. Without serialization, two quick
+// type_text calls truncate each other, and a key_press issued after
+// type_text lands in the middle of the text.
+//
+// The fix mirrors the mouse engine: one ordered queue of keyboard actions,
+// stepped from the drain tick. A text action is only submitted once the
+// previous injection has fully drained (keybuf_inject_active() == 0), and a
+// raw key event also waits for any in-flight text. Tools block on a pending
+// reply until their action has actually been consumed, so clients get
+// correct sequencing for free.
+// ---------------------------------------------------------------------------
+
+struct key_action {
+    int kind;            // 0 = text (keybuf_inject), 1 = raw key event
+    std::string text;    // kind 0
+    int scancode = 0;    // kind 1
+    int state = 0;       // kind 1: 1=down, 0=up
+    int delay_ticks = 0; // ticks to wait before this action runs
+    int reply_id = 0;    // pending reply delivered when the action completes
+    bool submitted = false; // kind 0: text handed to keybuf_inject
+};
+std::deque<key_action> g_key_q;   // guarded by g_q_mtx
+
+void enqueue_key(key_action &&a)
+{
+    std::lock_guard<std::mutex> g(g_q_mtx);
+    g_key_q.emplace_back(std::move(a));
+}
+
+// One step of the keyboard engine; called from mcpbridge_drain (emu thread).
+void key_engine_tick()
+{
+    int finished_reply = 0;
+    {
+        std::unique_lock<std::mutex> lk(g_q_mtx, std::try_to_lock);
+        if (!lk.owns_lock() || g_key_q.empty())
+            return;
+        key_action &a = g_key_q.front();
+        if (a.delay_ticks > 0) {
+            a.delay_ticks--;
+            return;
+        }
+        if (a.kind == 0) {
+            if (!a.submitted) {
+                if (keybuf_inject_active())
+                    return;                  // previous injection still draining
+                keybuf_inject(a.text.c_str());
+                a.submitted = true;
+                return;                      // re-check drain next tick
+            }
+            if (keybuf_inject_active())
+                return;                      // our text still draining
+            finished_reply = a.reply_id;
+            g_key_q.pop_front();
+        } else {
+            if (keybuf_inject_active())
+                return;                      // never interleave with text
+            record_key_direct((a.scancode << 1) | (a.state ? 0 : 1), true);
+            finished_reply = a.reply_id;
+            g_key_q.pop_front();
+        }
+    }
+    if (finished_reply)
+        deliver_pending(finished_reply, "done");
+}
+
+// ---------------------------------------------------------------------------
 // Serial bridge state (TX = guest->host capture, fed by serial_win32 tap).
 // ---------------------------------------------------------------------------
 std::mutex g_ser_mtx;
@@ -621,15 +693,25 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
     };
 
     // -- type_text -------------------------------------------------------
+    // Serialized through the keyboard engine; BLOCKS until the guest has
+    // consumed every character, so back-to-back type_text/key_press calls
+    // can never garble each other.
     if (name == "type_text") {
         std::string txt = obj_str(js, toks, args_idx, "text");
         if (txt.empty()) return err("missing or empty 'text'");
-        mcp_cmd c;
-        c.kind = CMD_TYPE_TEXT;
-        c.text = txt;
-        enqueue(std::move(c));
+        if (txt.size() > 4096) return err("text too long (>4096 chars)");
+        int rid = new_pending();
+        { key_action a; a.kind = 0; a.text = txt; a.reply_id = rid; enqueue_key(std::move(a)); }
+        // Drain rate is ~1 char per keyboard poll; budget generously.
+        int timeout = 15000 + (int)txt.size() * 200;
+        std::string done;
+        if (!wait_pending(rid, done, timeout)) {
+            drop_pending(rid);
+            return err("type_text did not complete (guest not consuming keys?)");
+        }
+        drop_pending(rid);
         char buf[64];
-        snprintf(buf, sizeof(buf), "queued %zu char(s)", txt.size());
+        snprintf(buf, sizeof(buf), "typed %zu char(s)", txt.size());
         return ok_text(buf);
     }
 
@@ -799,19 +881,30 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
         return ok_text(buf);
     }
 
-    // -- key_down / key_up ----------------------------------------------
+    // -- key_down / key_up (serialized, blocking) ------------------------
     if (name == "key_down" || name == "key_up") {
         std::string k = obj_str(js, toks, args_idx, "key");
         int sc = key_lookup(k);
         if (sc < 0) return err("unknown 'key': " + k);
-        mcp_cmd c; c.kind = CMD_KEY_RAW; c.a = sc; c.b = (name == "key_down") ? 1 : 0;
-        enqueue(std::move(c));
+        int rid = new_pending();
+        {
+            key_action a; a.kind = 1; a.scancode = sc;
+            a.state = (name == "key_down") ? 1 : 0;
+            a.reply_id = rid;
+            enqueue_key(std::move(a));
+        }
+        std::string done;
+        if (!wait_pending(rid, done, 15000)) {
+            drop_pending(rid);
+            return err(name + " did not complete");
+        }
+        drop_pending(rid);
         char buf[96];
-        snprintf(buf, sizeof(buf), "queued %s key=%s sc=0x%02x", name.c_str(), k.c_str(), sc);
+        snprintf(buf, sizeof(buf), "%s key=%s sc=0x%02x", name.c_str(), k.c_str(), sc);
         return ok_text(buf);
     }
 
-    // -- key_press (down + up, with optional modifiers) -----------------
+    // -- key_press (serialized, blocking; optional modifiers) -----------
     if (name == "key_press") {
         std::string k = obj_str(js, toks, args_idx, "key");
         int sc = key_lookup(k);
@@ -831,17 +924,36 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
                 idx = tok_skip(toks, idx);
             }
         }
-        // Press modifiers, press key, release key, release modifiers (LIFO).
+        // Press modifiers, press key, release key, release modifiers (LIFO),
+        // each transition spaced a few ticks so the guest's poll sees it.
+        // Built locally and pushed under ONE lock so the reply lands on the
+        // final action with no race against the drain.
+        int rid = new_pending();
+        std::vector<key_action> seq;
         for (int m : mods) {
-            mcp_cmd c; c.kind = CMD_KEY_RAW; c.a = m; c.b = 1; enqueue(std::move(c));
+            key_action a; a.kind = 1; a.scancode = m; a.state = 1; a.delay_ticks = 3;
+            seq.push_back(a);
         }
-        { mcp_cmd c; c.kind = CMD_KEY_RAW; c.a = sc; c.b = 1; enqueue(std::move(c)); }
-        { mcp_cmd c; c.kind = CMD_KEY_RAW; c.a = sc; c.b = 0; enqueue(std::move(c)); }
-        for (auto it = mods.rbegin(); it != mods.rend(); ++it) {
-            mcp_cmd c; c.kind = CMD_KEY_RAW; c.a = *it; c.b = 0; enqueue(std::move(c));
+        { key_action a; a.kind = 1; a.scancode = sc; a.state = 1; a.delay_ticks = 3; seq.push_back(a); }
+        { key_action a; a.kind = 1; a.scancode = sc; a.state = 0; a.delay_ticks = 4; seq.push_back(a); }
+        for (size_t i = mods.size(); i-- > 0; ) {
+            key_action a; a.kind = 1; a.scancode = mods[i]; a.state = 0; a.delay_ticks = 3;
+            seq.push_back(a);
         }
+        seq.back().reply_id = rid;
+        {
+            std::lock_guard<std::mutex> g(g_q_mtx);
+            for (auto &a : seq)
+                g_key_q.emplace_back(std::move(a));
+        }
+        std::string done;
+        if (!wait_pending(rid, done, 15000)) {
+            drop_pending(rid);
+            return err("key_press did not complete");
+        }
+        drop_pending(rid);
         char buf[96];
-        snprintf(buf, sizeof(buf), "queued key_press key=%s (sc=0x%02x) +%zu modifier(s)",
+        snprintf(buf, sizeof(buf), "pressed key=%s (sc=0x%02x) +%zu modifier(s)",
                  k.c_str(), sc, mods.size());
         return ok_text(buf);
     }
@@ -1701,7 +1813,7 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
 const char *TOOLS_LIST_JSON =
 "{\"tools\":["
   "{\"name\":\"type_text\","
-    "\"description\":\"Type ASCII text into the running Amiga via keybuf_inject. Only chars representable on the US Amiga keyboard work; newline = Return.\","
+    "\"description\":\"Type ASCII text into the running Amiga. Serialized and BLOCKING: returns only after the guest has consumed every character, so sequential type_text/key_press calls are safe. Only chars on the US Amiga keyboard; newline = Return. Max 4096 chars.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}},"
   "{\"name\":\"mouse_move\","
     "\"description\":\"Move the pointer to absolute Intuition SCREEN PIXEL coordinates (0,0 = screen top-left, same coordinate space as get_pointer_pos). CLOSED-LOOP: reads the live pointer position and self-corrects, so it is accurate regardless of resolution/interlace/centering. BLOCKS until arrived. (space='amiga' selects the legacy rtarea path that needs mousehack alive; the default/host path is recommended.)\","
@@ -1722,13 +1834,13 @@ const char *TOOLS_LIST_JSON =
     "\"description\":\"Mouse wheel delta. dy = vertical, dx = horizontal. Use multiples of 120 for one notch.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"dx\":{\"type\":\"integer\"},\"dy\":{\"type\":\"integer\"}}}},"
   "{\"name\":\"key_down\","
-    "\"description\":\"Press a key (does not release). key: symbolic name (Enter, F10, LShift, a, 1, ...) or '0xNN' Amiga scancode.\","
+    "\"description\":\"Press a key (does not release). Serialized after any in-flight text; blocking. key: symbolic name (Enter, F10, LShift, a, 1, ...) or '0xNN' Amiga scancode.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"]}},"
   "{\"name\":\"key_up\","
-    "\"description\":\"Release a key. See key_down for the 'key' format.\","
+    "\"description\":\"Release a key. Serialized + blocking. See key_down for the 'key' format.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"]}},"
   "{\"name\":\"key_press\","
-    "\"description\":\"Press and release a key, optionally holding modifiers. modifiers: array of LShift/RShift/Ctrl/LAlt/RAlt/LAmiga/RAmiga/etc.\","
+    "\"description\":\"Press and release a key, optionally holding modifiers (LShift/RShift/Ctrl/LAlt/RAlt/LAmiga/RAmiga/...). Serialized after any in-flight text and vsync-paced; BLOCKS until the full sequence is delivered.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"modifiers\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"key\"]}},"
   "{\"name\":\"mousehack_status\","
     "\"description\":\"Returns input_tablet/mousehack_alive/magic_mouse flags so the client can tell whether absolute mouse positioning will visibly move the Amiga pointer.\","
@@ -2156,6 +2268,8 @@ extern "C" void mcpbridge_drain(void)
     // One paced step of the mouse engine per drain tick (see comments at
     // the mouse_action queue for the 8-bit counter aliasing rationale).
     mouse_engine_tick();
+    // One step of the keyboard serializer (text + raw keys in strict order).
+    key_engine_tick();
 
     std::deque<mcp_cmd> local;
     {

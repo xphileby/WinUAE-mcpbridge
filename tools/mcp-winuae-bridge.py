@@ -53,8 +53,23 @@ CACHE_PATH = os.environ.get("MCP_WINUAE_CACHE", _default_cache_path())
 # forwarder filters responses bearing this id so they never reach the client.
 PROBE_ID = "__relay_tools_probe__"
 
-SERVER_INFO = {"name": "winuae-mcpbridge-relay", "version": "1.0"}
+SERVER_INFO = {"name": "winuae-mcpbridge-relay", "version": "1.1"}
 PROTOCOL_VERSION = "2024-11-05"
+
+# Relay-local tool: lets the client check whether the emulator is reachable
+# WITHOUT touching WinUAE, so it can avoid firing real actions when the
+# emulator is down. Always present in tools/list, answered by the relay.
+RELAY_STATUS_TOOL = {
+    "name": "winuae_status",
+    "description": (
+        "Report whether WinUAE (the emulator) is currently connected to this "
+        "MCP relay. Answered by the relay itself, so it works even when the "
+        "emulator is down. Returns {connected, host, port, "
+        "seconds_since_change, tools_cached}. Call this before issuing real "
+        "tool actions if you are unsure the emulator is running."
+    ),
+    "inputSchema": {"type": "object", "properties": {}},
+}
 
 
 def out(obj):
@@ -77,6 +92,20 @@ class Relay:
         self.tools_sig = json.dumps(self.tools, sort_keys=True)
         self.client_ready = False     # client has sent initialize
         self.stop = False
+        self.connected = False        # WinUAE reachable (debounced view)
+        self.changed_at = time.time() # last connect/disconnect transition
+
+    def _set_connected(self, value):
+        with self.lock:
+            if self.connected == value:
+                return
+            self.connected = value
+            self.changed_at = time.time()
+        if self.client_ready:
+            out({"jsonrpc": "2.0",
+                 "method": "notifications/winuae_connected" if value
+                 else "notifications/winuae_disconnected",
+                 "params": {"connected": value}})
 
     # ---- tool cache -----------------------------------------------------
     def _load_cache(self):
@@ -120,6 +149,7 @@ class Relay:
             s.settimeout(None)
             with self.lock:
                 self.sock = s
+            self._set_connected(True)
             log(f"connected to WinUAE at {HOST}:{PORT}")
             # Refresh the tool cache from the live server.
             try:
@@ -131,6 +161,7 @@ class Relay:
             self._read_forward(s)
             with self.lock:
                 self.sock = None
+            self._set_connected(False)
             try:
                 s.close()
             except OSError:
@@ -206,8 +237,25 @@ class Relay:
         if method == "tools/list":
             with self.lock:
                 tools = list(self.tools)
+            # Always advertise the relay-local status tool.
+            tools = [RELAY_STATUS_TOOL] + tools
             if is_request:
                 out({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}})
+            return
+
+        # Relay-local tool: winuae_status (answered without touching WinUAE).
+        if method == "tools/call" and \
+                (req.get("params") or {}).get("name") == "winuae_status":
+            with self.lock:
+                connected = self.connected
+                since = round(time.time() - self.changed_at, 1)
+                ncached = len(self.tools)
+            payload = {"connected": connected, "host": HOST, "port": PORT,
+                       "seconds_since_change": since, "tools_cached": ncached}
+            if is_request:
+                out({"jsonrpc": "2.0", "id": rid, "result": {
+                    "content": [{"type": "text",
+                                 "text": json.dumps(payload)}]}})
             return
 
         # Everything else (tools/call, etc.) -> proxy to WinUAE.
