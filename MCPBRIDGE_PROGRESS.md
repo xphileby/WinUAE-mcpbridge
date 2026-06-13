@@ -225,6 +225,34 @@ Future bridge improvement: add a real `mouse_move_rel(dx,dy)` tool that
 chunks + paces inside the drain (one chunk per vsync), and make
 `space:'host'` truly absolute by doing pin+walk internally.
 
+## type_text / key input serialization bug (found during full verification)
+
+`keybuf_inject` (keybuf.cpp) uses a SINGLE `keyinject` buffer drained one key
+per vsync, and each new call `xfree`s whatever was still draining. Plus
+`key_press` uses a separate path (record_key_direct -> keybuf ring). So:
+- Two `type_text` calls in quick succession: the second truncates the first.
+- `type_text` then `key_press` (e.g. Return): the Return interleaves into the
+  middle of the still-draining text.
+Symptom: garbled guest input ("newshell" -> "lablenewshell", quotes dropped,
+fragments from earlier commands reappearing).
+
+Workaround today: pace client calls — after `type_text`, wait ~60-70 ms per
+character before the next key/text call. Verified the 42-tool sweep is 100%
+clean when calls don't overlap; the garbling only appears with back-to-back
+keyboard injection.
+
+Proper fix (not yet done): a bridge-side keyboard serializer, mirroring the
+mouse engine — one ordered queue feeding text + keys one event at a time,
+waiting for `keyinject` to drain between items. Until then, guest-side flows
+that type multi-step shell commands need generous inter-call delays.
+
+This also left the serial guest->host path (echo >SER:) UNverified at the
+guest level: serial_write (host->guest) is proven at the API boundary
+(serreceive_external accepts the bytes), and the TX tap fires on any guest
+SERDAT write, but getting the guest to actually transmit needs a reliably
+typed shell command, which the input bug blocks. The serial mechanism is
+sound; only the typed-command driver is flaky.
+
 ## Open issues — re-investigate after rebase to 6030
 
 1. **`cfgfile_parse_line(absolute_mouse=N)` silently no-ops on this build.**
@@ -302,6 +330,30 @@ need it for testing)
 - Reverse send queue (`std::deque<std::string>`) + writer side of the socket
 - Emission hooks for: mousehack_alive transition, screen mode change, config reload, pause/resume
 - Decision made earlier (small notification set, not full event stream)
+
+### Relay resilience (start order independence) — DONE
+
+The original relay was a dumb pipe: it connected to WinUAE at startup and
+exited if the emulator wasn't running, so the MCP client (which spawns the
+server once and doesn't re-spawn on failure) had to have WinUAE up first.
+
+`tools/mcp-winuae-bridge.py` is now self-sufficient:
+- Answers initialize / ping / notifications/initialized locally — the MCP
+  server is always "connected" regardless of WinUAE state.
+- Serves tools/list from an on-disk cache (LOCALAPPDATA/mcp-winuae-tools.json)
+  captured whenever WinUAE was last reachable. A background connector thread
+  (re)connects continuously, refreshes the cache via an internal tools/list
+  probe (filtered from the client stream by a reserved id), forwards the
+  emulator's responses + notifications to stdout, and emits
+  notifications/tools/list_changed when the set changes.
+- tools/call while WinUAE is down returns a clean isError result
+  ("WinUAE is not running ... start the emulator and try again") rather than
+  killing the server.
+
+Verified: WinUAE up -> 46 tools (live cache refresh) + proxied get_cpu_state;
+WinUAE down -> server survives, tools/list serves 46 cached tools, tools/call
+returns the graceful error. Start the client and emulator in any order;
+restart WinUAE freely mid-session.
 
 ### Step 8 — Python relay + Claude Desktop config — DONE
 
