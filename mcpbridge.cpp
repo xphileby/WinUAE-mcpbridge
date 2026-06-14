@@ -641,6 +641,28 @@ const keyent KEY_TABLE[] = {
     // Function keys
     {"f1", 0x50}, {"f2", 0x51}, {"f3", 0x52}, {"f4", 0x53}, {"f5", 0x54},
     {"f6", 0x55}, {"f7", 0x56}, {"f8", 0x57}, {"f9", 0x58}, {"f10", 0x59},
+    // Numeric keypad (Amiga rawkey codes). On the US keymap the digit keys
+    // produce the same characters as the main-row digits.
+    {"kp0", 0x0f}, {"numpad0", 0x0f},
+    {"kp1", 0x1d}, {"numpad1", 0x1d},
+    {"kp2", 0x1e}, {"numpad2", 0x1e},
+    {"kp3", 0x1f}, {"numpad3", 0x1f},
+    {"kp4", 0x2d}, {"numpad4", 0x2d},
+    {"kp5", 0x2e}, {"numpad5", 0x2e},
+    {"kp6", 0x2f}, {"numpad6", 0x2f},
+    {"kp7", 0x3d}, {"numpad7", 0x3d},
+    {"kp8", 0x3e}, {"numpad8", 0x3e},
+    {"kp9", 0x3f}, {"numpad9", 0x3f},
+    {"kpdot", 0x3c}, {"kpperiod", 0x3c}, {"numpaddot", 0x3c},
+    {"kpminus", 0x4a}, {"kpsub", 0x4a},
+    {"kpdiv", 0x5c}, {"kpdivide", 0x5c},
+    {"kpmul", 0x5d}, {"kpmultiply", 0x5d},
+    {"kpadd", 0x5e}, {"kpplus", 0x5e},
+    {"kplparen", 0x5a}, {"kpleftparen", 0x5a},
+    {"kprparen", 0x5b}, {"kprightparen", 0x5b},
+    // Non-US keys (absent on US keyboards; codes for intl layouts).
+    {"nonus_hash", 0x2a},       // # ~ key (UK/DE etc.)
+    {"nonus_backslash", 0x30},  // \ | or < > key next to left Shift
     // Modifiers
     {"lshift", 0x60}, {"leftshift", 0x60}, {"shift", 0x60},
     {"rshift", 0x61}, {"rightshift", 0x61},
@@ -901,6 +923,46 @@ dispatch_result dispatch_tool(const std::string &name, const char *js,
         drop_pending(rid);
         char buf[96];
         snprintf(buf, sizeof(buf), "%s key=%s sc=0x%02x", name.c_str(), k.c_str(), sc);
+        return ok_text(buf);
+    }
+
+    // -- keyboard_release_all -------------------------------------------
+    // Force-release every modifier (and optionally every key 0x00-0x67).
+    // Recovers from a stuck modifier — e.g. a dropped release that makes
+    // Amiga/Shift hotkeys stop working — and clears stuck movement keys in
+    // games. Serialized through the keyboard engine; blocking.
+    if (name == "keyboard_release_all") {
+        bool all = false;
+        {
+            int i = obj_find(js, toks, args_idx, "all");
+            if (i >= 0) { std::string s = tok_str(js, toks[i]); all = (s == "true"); }
+        }
+        std::vector<int> codes;
+        if (all) {
+            for (int sc = 0x00; sc <= 0x67; ++sc) codes.push_back(sc);
+        } else {
+            int mods[] = {0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67};
+            for (int m : mods) codes.push_back(m);
+        }
+        int rid = new_pending();
+        std::vector<key_action> seq;
+        for (int sc : codes) {
+            key_action a; a.kind = 1; a.scancode = sc; a.state = 0; a.delay_ticks = 1;
+            seq.push_back(a);
+        }
+        seq.back().reply_id = rid;
+        {
+            std::lock_guard<std::mutex> g(g_q_mtx);
+            for (auto &a : seq) g_key_q.emplace_back(std::move(a));
+        }
+        std::string done;
+        if (!wait_pending(rid, done, 20000)) {
+            drop_pending(rid);
+            return err("keyboard_release_all did not complete");
+        }
+        drop_pending(rid);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "released %zu key(s)", codes.size());
         return ok_text(buf);
     }
 
@@ -1842,6 +1904,9 @@ const char *TOOLS_LIST_JSON =
   "{\"name\":\"key_press\","
     "\"description\":\"Press and release a key, optionally holding modifiers (LShift/RShift/Ctrl/LAlt/RAlt/LAmiga/RAmiga/...). Serialized after any in-flight text and vsync-paced; BLOCKS until the full sequence is delivered.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"modifiers\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"key\"]}},"
+  "{\"name\":\"keyboard_release_all\","
+    "\"description\":\"Force-release all modifier keys (default) or every key (all:true). Use to recover if Amiga/Shift hotkeys stop responding (a stuck modifier) or to clear stuck movement keys in a game.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"all\":{\"type\":\"boolean\"}}}},"
   "{\"name\":\"mousehack_status\","
     "\"description\":\"Returns input_tablet/mousehack_alive/magic_mouse flags so the client can tell whether absolute mouse positioning will visibly move the Amiga pointer.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
